@@ -277,14 +277,35 @@ class State:
                 conn.execute("DELETE FROM part_answers WHERE chat_id = ?", (cid,))
 
     def update_messages(self, updates: dict[str, list[dict[str, Any]]]) -> None:
-        """Rewrite stored messages (a new redaction policy) in one transaction, then compact the
-        file so no page with the old text survives."""
+        """Rewrite stored messages (a new redaction policy) in one transaction."""
         with self.transaction() as conn:
             for cid, messages in updates.items():
                 conn.execute(
                     "UPDATE chats SET messages = ? WHERE chat_id = ?",
                     (json.dumps(messages, ensure_ascii=False), cid),
                 )
+
+    def rewrite_docs(self, transform: Callable[[Any], Any], keep: Iterable[str] = ()) -> int:
+        """Apply ``transform`` to every stored JSON document except ``keep``; return how many
+        changed. Used to re-redact derived documents when the redaction policy changes."""
+        skip = set(keep)
+        changed = 0
+        with self.transaction() as conn:
+            for name, data in conn.execute("SELECT name, data FROM docs").fetchall():
+                if name in skip:
+                    continue
+                value = json.loads(data)
+                new = transform(value)
+                if new != value:
+                    changed += 1
+                    conn.execute(
+                        "UPDATE docs SET data = ? WHERE name = ?",
+                        (json.dumps(new, sort_keys=True, ensure_ascii=False), name),
+                    )
+        return changed
+
+    def vacuum(self) -> None:
+        """Rewrite the database file so no free page keeps text that was replaced."""
         self.conn.execute("VACUUM")
 
     def set_status(self, cid: str, status: str, flagged: str = "", note: str = "") -> None:

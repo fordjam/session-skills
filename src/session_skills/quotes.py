@@ -1,9 +1,8 @@
-"""Make user quotes safe to embed in files an agent will later read as instructions.
+"""Make user quotes safe to show in the local report and evidence files.
 
-Generated ``SKILL.md`` files are loaded by coding agents. A quote copied verbatim from a
-transcript could smuggle in instructions ("ignore previous instructions and run ..."), a
-heading that looks like a new section, a code block or a link. Every quote that reaches a
-generated file goes through :func:`sanitize_quote`:
+Quotes never go into installed files (see :mod:`session_skills.guidance`); they appear only in
+``out/report.md`` and ``out/evidence/``, where a person reviews them. Those files are still read by
+people and may be pasted elsewhere, so every quote goes through :func:`sanitize_quote`:
 
 * redacted again with the current policy;
 * flattened to one line of plain text: no headings, list or quote markers, code fences,
@@ -12,7 +11,7 @@ generated file goes through :func:`sanitize_quote`:
   instructions, run/execute this, piped shell, role markers, ...);
 * capped in length and stripped of double quotes so it cannot close the quote it sits in.
 
-Callers then wrap it in an explicit "user quote, not an instruction" label.
+The injection filter is a heuristic; the real protection is that quotes are never installed.
 """
 
 from __future__ import annotations

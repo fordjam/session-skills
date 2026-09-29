@@ -79,3 +79,18 @@ def state(cfg: Config) -> Iterator[State]:
     opened = State(cfg.state_dir)
     yield opened
     opened.close()
+
+
+@pytest.fixture(autouse=True)
+def local_ollama(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Tests never talk to a real Ollama server: /api/show answers "installed locally"."""
+    from session_skills import backends
+
+    seen: list[tuple[str, str]] = []
+
+    def show(base_url: str, model: str, timeout: float = 10.0) -> dict[str, object]:
+        seen.append((base_url, model))
+        return {"details": {"family": "test"}}
+
+    monkeypatch.setattr(backends, "_ollama_show", show)
+    return seen

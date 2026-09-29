@@ -415,3 +415,59 @@ def test_readme_is_consistent_with_code():
     assert f"`{defaults.calibrate_backend}` (default calibrator)" in readme
     assert f"at most {defaults.max_requests} backend calls per run" in readme
     assert "keeps everything on your machine" not in readme  # the old, unconditional claim
+
+
+# -- round 2: ollama locality is checked by IP and by the server's own model metadata -----------
+
+@pytest.mark.parametrize("host", [
+    "https://127.attacker.example:11434",  # round-2 reviewer's bypass
+    "127.0.0.1.evil.example",
+    "localhost.evil.example",
+    "http://[::ffff:10.0.0.1]:11434",
+    "ftp://127.0.0.1",
+    "not a host at all:::",
+])
+def test_ollama_hostnames_are_not_trusted_by_prefix(host, monkeypatch, local_ollama):
+    monkeypatch.setenv("OLLAMA_HOST", host)
+    with pytest.raises(FatalBackendError):
+        make_backend("ollama:llama3.2", local_only=True)
+    assert local_ollama == []  # nothing was contacted
+
+
+@pytest.mark.parametrize(("host", "base"), [
+    ("127.0.0.2:8080", "http://127.0.0.2:8080"),
+    ("http://[::1]:11434", "http://[::1]:11434"),
+    ("", "http://127.0.0.1:11434"),
+])
+def test_ollama_verifies_the_model_on_the_loopback_server(host, base, monkeypatch, local_ollama):
+    monkeypatch.setenv("OLLAMA_HOST", host)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    backend = make_backend("ollama:llama3.2", local_only=True)
+    assert local_ollama == [(base, "llama3.2")]
+    assert backend.describe()["destination"] == "local"
+    assert "HTTPS_PROXY" not in backend.describe()["env"]  # a proxy could forward "local" traffic
+
+
+def test_ollama_model_that_is_missing_or_remote_is_refused(monkeypatch):
+    import urllib.error
+
+    from session_skills import backends
+
+    def missing(base_url, model, timeout=10.0):
+        raise urllib.error.HTTPError(base_url, 404, "not found", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(backends, "_ollama_show", missing)
+    with pytest.raises(FatalBackendError, match="not installed"):
+        make_backend("ollama:llama3.2")
+
+    monkeypatch.setattr(backends, "_ollama_show", lambda *a, **k: {"remote_model": "big", "remote_host": "https://ollama.com:443"})
+    with pytest.raises(FatalBackendError, match="runs remotely"):
+        make_backend("ollama:my-alias")  # a local-looking name that is really a cloud model
+
+    def down(*a, **k):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(backends, "_ollama_show", down)
+    with pytest.raises(FatalBackendError, match="could not reach"):
+        make_backend("ollama:llama3.2")
+    assert make_backend("ollama:llama3.2", allow_remote=True).describe()["destination"] == "remote"

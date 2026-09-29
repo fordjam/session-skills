@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .brief import BEGIN, END, skill_names
+from .guidance import problems
 from .state import State
 
 AGENTS = ("claude", "opencode", "codex")
@@ -153,6 +154,7 @@ def plan_install(
         if not _SKILL_NAME.match(name):
             raise InstallError(f"refusing unexpected skill name {name!r}")
         new = (state.root / "out" / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
+        _refuse_unsafe(new, f"skill {name}")
         dest = where.skills_dir / name / "SKILL.md"
         old = _read(dest)
         if old == new:
@@ -163,11 +165,20 @@ def plan_install(
             plan.copy.append(name)
             plan.changes.append(Change(dest, old, new, f"skill {name}"))
     if rules:
+        block = rules_block(state, agent)
+        _refuse_unsafe(block, "rules block")
         old = _read(where.rules_file)
-        new = merge_block(old, rules_block(state, agent))
+        new = merge_block(old, block)
         if new != old:
             plan.changes.append(Change(where.rules_file, old, new, f"rules block in {where.rules_file.name}"))
     return plan
+
+
+def _refuse_unsafe(text: str, what: str) -> None:
+    """Installed text must fit the guidance shape (no paths, URLs, commands, credentials...)."""
+    issues = problems(text)
+    if issues:
+        raise InstallError(f"refusing to install {what}; it does not look like generated guidance: {issues[0]}")
 
 
 def _atomic_write(path: Path, text: str) -> None:

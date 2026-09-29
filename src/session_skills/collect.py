@@ -79,9 +79,24 @@ def event_dates(messages: Sequence[dict[str, Any]], fallback: str) -> tuple[str,
     return (dates[0] if dates else fallback, dates[-1] if dates else fallback)
 
 
+def _redact_json(value: Any, opts: RedactOptions) -> Any:
+    if isinstance(value, str):
+        return redact(value, opts)
+    if isinstance(value, list):
+        return [_redact_json(v, opts) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_json(v, opts) for k, v in value.items()}
+    return value
+
+
 def refresh_redaction(cfg: Config, state: State) -> int:
-    """Re-redact every stored chat when the redaction policy changed (for example a new deny
-    word). Chats whose source files are gone are fixed too. Returns how many chats changed."""
+    """Apply a changed redaction policy (for example a new deny word) to everything already
+    stored: chat text (including chats whose source files are gone), derived documents in the
+    database such as the repeated-ask report, and generated files under ``out/``. The database
+    is then compacted so no free page keeps the old text. Returns how many chats changed.
+
+    Not touched: ``backups/``, which holds copies of your own instruction files taken by
+    ``install``."""
     opts = cfg.redact_options()
     fingerprint = policy_fingerprint(opts)
     if state.read_json("redaction_policy").get("fingerprint") == fingerprint:
@@ -94,8 +109,24 @@ def refresh_redaction(cfg: Config, state: State) -> int:
             updates[cid] = cleaned
     if updates:
         state.update_messages(updates)
+    state.rewrite_docs(lambda value: _redact_json(value, opts), keep=("redaction_policy",))
+    out = state.root / "out"
+    if out.is_dir():
+        for path in sorted(out.rglob("*")):
+            if path.is_file() and not path.name.startswith("."):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                cleaned_text = _redact_lines(text, opts)
+                if cleaned_text != text:
+                    state.write_text(path, cleaned_text)
     state.write_json("redaction_policy", {"fingerprint": fingerprint})
+    state.vacuum()
     return len(updates)
+
+
+def _redact_lines(text: str, opts: RedactOptions) -> str:
+    """Redact a generated file line by line, so the pasted-block rule never collapses ordinary
+    report tables."""
+    return "\n".join(redact(line, opts) if line.strip() else line for line in text.split("\n"))
 
 
 def adapters_for(cfg: Config, only: Sequence[str] = ()) -> list[Adapter]:

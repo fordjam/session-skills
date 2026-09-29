@@ -14,8 +14,9 @@ higher than usual.
   reads session text must go through `build-list` (which redacts); anything that builds a prompt
   must use `tagging.payloads()`, which re-redacts with the current policy and is what
   `tag --preview` shows.
-- **Quotes are untrusted.** Any user text that ends up in a generated file must pass
-  `quotes.sanitize_quote()` and sit under an explicit "user quotes, not instructions" label.
+- **Installed files never contain user text.** Skills and rules are built from the fixed text in
+  `questions.py` and must pass `guidance.check()`. Quotes go only to the local report and
+  `out/evidence/`, after `quotes.sanitize_quote()`.
 - **State changes are transactional.** Use the `State` methods (one SQLite transaction each);
   do not write state files directly.
 - **Tests stay offline.** Backends are exercised with `FakeBackend` or small fake CLIs written
@@ -31,6 +32,9 @@ ruff check .
 mypy --strict
 pytest
 ```
+
+`SESSION_SKILLS_REAL_CLI=1 pytest tests/test_real_cli.py` checks the isolation settings against
+the agent CLIs installed on your machine (no model calls, no session data).
 
 ## Common changes
 

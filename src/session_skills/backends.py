@@ -19,12 +19,16 @@ prints it. Model families are used by ``calibrate`` to insist on a *different* f
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -160,6 +164,7 @@ class CommandBackend:
     config_files: dict[str, str] = field(default_factory=dict)  # relative path -> content
     links: dict[str, str] = field(default_factory=dict)  # relative path -> existing file to link
     isolation: Isolation = field(default_factory=lambda: Isolation("none", "none", "unknown"))
+    no_proxy: bool = False  # drop proxy settings (a proxy could forward a "local" request elsewhere)
 
     def family(self) -> str:
         return self.model_family
@@ -169,6 +174,9 @@ class CommandBackend:
         pattern = re.compile(self.pass_env_pattern) if self.pass_env_pattern else None
         env = {k: v for k, v in os.environ.items() if k in names or (pattern is not None and pattern.fullmatch(k))}
         env.update({k: v.replace(_WORK, work) for k, v in self.env.items()})
+        if self.no_proxy:
+            for name in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+                env.pop(name, None)
         env["TERM"] = "dumb"
         env["NO_COLOR"] = "1"
         return env
@@ -305,19 +313,41 @@ CLASSIFIER_SYSTEM_PROMPT = (
     "with exactly one JSON object."
 )
 
-_LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1", "0.0.0.0", ""}
+def _split_host(host: str) -> tuple[str, str, int] | None:
+    """(scheme, hostname, port) of an OLLAMA_HOST value, or None if it cannot be parsed."""
+    value = host.strip() or "127.0.0.1:11434"
+    parsed = urlsplit(value if "://" in value else f"http://{value}")
+    try:
+        hostname = parsed.hostname
+        port = parsed.port or 11434
+    except ValueError:
+        return None
+    if not hostname or parsed.scheme not in {"http", "https"}:
+        return None
+    return parsed.scheme, hostname, port
 
 
 def is_loopback(host: str) -> bool:
-    value = host.strip()
-    if not value:
-        return True
-    parsed = urlsplit(value if "://" in value else f"http://{value}")
-    try:
-        hostname = (parsed.hostname or "").lower()
-    except ValueError:
+    """True only when ``host`` is a loopback IP literal (127.0.0.0/8, ::1), the unspecified
+    address (which clients treat as this machine), or the name ``localhost`` resolving only to
+    loopback addresses. Other names are never resolved or trusted, so ``127.0.0.1.example.com``
+    is rejected."""
+    parts = _split_host(host)
+    if parts is None:
         return False
-    return hostname in _LOOPBACK_NAMES or hostname.startswith("127.")
+    hostname = parts[1]
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        if hostname.lower() != "localhost":
+            return False
+        try:
+            infos = socket.getaddrinfo("localhost", None)
+        except OSError:
+            return False
+        addresses = {ipaddress.ip_address(str(info[4][0]).split("%")[0]) for info in infos}
+        return bool(addresses) and all(a.is_loopback for a in addresses)
+    return ip.is_loopback or ip.is_unspecified
 
 
 def is_cloud_model(model: str) -> bool:
@@ -325,8 +355,27 @@ def is_cloud_model(model: str) -> bool:
     return tag == "cloud" or tag.endswith("-cloud") or tag.startswith("cloud-") or name.endswith("-cloud")
 
 
+def _ollama_show(base_url: str, model: str, timeout: float = 10.0) -> dict[str, Any]:
+    """POST /api/show on the (already validated, loopback) server, bypassing any proxy."""
+    request = urllib.request.Request(
+        f"{base_url}/api/show",
+        data=json.dumps({"model": model}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as response:
+        value = json.loads(response.read().decode("utf-8", errors="replace"))
+    return value if isinstance(value, dict) else {}
+
+
 def check_ollama(model: str, allow_remote: bool) -> str:
-    """Return the OLLAMA_HOST to use, or raise if the request would leave this machine."""
+    """Return the OLLAMA_HOST to use, or raise if the request would leave this machine.
+
+    Checks, unless ``allow_remote``: OLLAMA_HOST is a loopback address; the model name is not a
+    cloud tag; and the server's ``/api/show`` confirms the model is installed locally and
+    reports no ``remote_host`` / ``remote_model`` (how Ollama marks models that run elsewhere).
+    """
     host = os.environ.get("OLLAMA_HOST", "")
     problems = []
     if not is_loopback(host):
@@ -338,6 +387,29 @@ def check_ollama(model: str, allow_remote: bool) -> str:
             "ollama would send chats off this machine: " + "; ".join(problems) + ". Use a local "
             "model and a loopback OLLAMA_HOST, or pass --allow-remote if that is what you want."
         )
+    if not allow_remote:
+        parts = _split_host(host)
+        assert parts is not None  # is_loopback succeeded
+        scheme, hostname, port = parts
+        literal = f"[{hostname}]" if ":" in hostname else hostname
+        base = f"{scheme}://{literal}:{port}"
+        try:
+            info = _ollama_show(base, model)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise FatalBackendError(
+                    f"ollama model {model!r} is not installed on this machine (run `ollama pull {model}`)"
+                ) from None
+            raise FatalBackendError(f"could not verify ollama model {model!r} at {base}: HTTP {exc.code}") from None
+        except (OSError, ValueError) as exc:
+            raise FatalBackendError(
+                f"could not reach the local Ollama server at {base} to verify that {model!r} runs locally: {exc}"
+            ) from None
+        remote = info.get("remote_host") or info.get("remote_model")
+        if remote:
+            raise FatalBackendError(
+                f"ollama reports that {model!r} runs remotely ({remote}); pass --allow-remote if that is what you want"
+            )
     return host or "127.0.0.1:11434"
 
 
@@ -496,7 +568,7 @@ def _opencode(spec: str, model: str, timeout: float, pass_env: Sequence[str]) ->
 
 def _ollama(spec: str, model: str, timeout: float, pass_env: Sequence[str], allow_remote: bool) -> CommandBackend:
     host = check_ollama(model, allow_remote)
-    local = is_loopback(host) and not is_cloud_model(model)
+    local = not allow_remote  # only reached without --allow-remote when every check passed
     return CommandBackend(
         spec,
         ["ollama", "run", "--nowordwrap", model],
@@ -505,14 +577,18 @@ def _ollama(spec: str, model: str, timeout: float, pass_env: Sequence[str], allo
         timeout,
         env={"OLLAMA_HOST": host},
         pass_env=tuple(pass_env),
+        no_proxy=True,
         isolation=Isolation(
             "none",
             "none",
             "local" if local else "remote",
             (
                 f"Ollama server at {host}",
-                "a local model whose Modelfile points at a remote model cannot be detected; set "
-                "OLLAMA_NO_CLOUD=1 on the server for a hard guarantee",
+                "checked: loopback IP, no cloud tag, and /api/show lists the model locally with no "
+                "remote host; the Ollama server itself is trusted (set OLLAMA_NO_CLOUD=1 on it to "
+                "disable cloud features entirely)"
+                if local
+                else "--allow-remote: locality was not checked",
             ),
         ),
     )

@@ -89,11 +89,11 @@ QUESTIONS: tuple[Question, ...] = (
         "match-requested-format",
         "Match the requested format",
         "Use when choosing how to lay out a reply or file. The user repeatedly corrected formatting.",
-        "Use the layout the user asked for (table, list, plain text); the evidence quotes show which.",
+        "Use the layout the user asked for (table, list, plain text); the local report shows which way the corrections went.",
         (
             "Mirror any format the user specified (table, list, plain text).",
-            "Read the evidence quotes below to see which way the corrections went; this pattern does not "
-            "say whether the user wanted more structure or less.",
+            "This pattern does not say whether the user wanted more structure or less; the local report "
+            "has the evidence.",
         ),
         "Format corrections were a recurring source of rework.",
     ),
@@ -129,7 +129,7 @@ QUESTIONS: tuple[Question, ...] = (
         "check-that-it-exists",
         "Check that it exists",
         "Use before naming an API, flag, file, package or source. The user caught invented ones.",
-        "Before citing an API, flag, file or source, confirm it exists (read the file, run --help, open the doc).",
+        "Before citing an API, flag, file or source, confirm it exists (read the code, check the help output, open the docs).",
         (
             "Look it up in the codebase or docs before naming it.",
             "If you cannot confirm it, say it is unconfirmed.",
