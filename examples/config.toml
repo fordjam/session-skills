@@ -1,0 +1,43 @@
+# session-skills configuration. Copy to ~/.config/session-skills/config.toml and edit.
+# Every key is optional; the values shown are the defaults unless noted.
+
+# Private state (redacted chats, tags, report). Must be outside any repository.
+state_dir = "~/.local/state/session-skills"
+
+[sources.claude_code]
+enabled = true
+paths = ["~/.claude/projects/**/*.jsonl"]
+
+[sources.codex]
+enabled = true
+paths = ["~/.codex/sessions/**/*.jsonl", "~/.codex/archived_sessions/**/*.jsonl"]
+
+[sources.opencode]
+enabled = true
+paths = ["~/.local/share/opencode/opencode*.db", "~/.local/share/opencode/storage"]
+
+[tag]
+backend = "claude:haiku"   # cheap model: one short classification per chat
+max_requests = 200         # per run; re-run to continue
+max_chars = 90000          # longer chats are split into parts
+retries = 3
+timeout = 300
+
+[calibrate]
+backend = "codex"          # must be a different model family from the tagger
+sample_size = 30
+min_agreement = 0.8
+default_threshold = 0.7
+
+[brief]
+min_chats = 3              # a pattern needs at least this many chats
+stale_days = 60            # patterns not seen for this long are dropped
+
+[repeated]
+max_chars = 200            # only short messages count as "asks"
+min_sessions = 3
+
+[redact]
+deny_words = []            # e.g. people, customers, project code names (example values only)
+extra_patterns = []        # extra regular expressions to remove
+max_block_lines = 12       # longer pasted blocks are replaced by a placeholder
