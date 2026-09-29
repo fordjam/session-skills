@@ -409,7 +409,7 @@ def test_example_config_matches_code_defaults():
 
 def test_readme_is_consistent_with_code():
     readme = (ROOT / "README.md").read_text()
-    assert "<you>" not in readme and "github.com/OWNER/session-skills" in readme
+    assert "<you>" not in readme and "github.com/fordjam/session-skills" in readme
     defaults = Config()
     assert f"`{defaults.tag_backend}` (default tagger)" in readme
     assert f"`{defaults.calibrate_backend}` (default calibrator)" in readme

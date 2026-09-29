@@ -21,7 +21,7 @@ chats, and back every pattern with counts and a short quote.
 Requires Python 3.11+ on macOS or Linux. There are no runtime dependencies.
 
 ```sh
-pipx install git+https://github.com/OWNER/session-skills   # replace OWNER; or: pip install .
+pipx install git+https://github.com/fordjam/session-skills   # or, from a clone: pip install .
 session-skills --help
 ```
 
