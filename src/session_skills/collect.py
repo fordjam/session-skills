@@ -7,9 +7,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Config
+from .guidance import problems as guidance_problems
 from .redact import RedactOptions, policy_fingerprint, redact
 from .sources import Adapter, Session, make_adapter
-from .state import State, chat_id
+from .state import RETENTION_VERSION, State, chat_id
 
 
 @dataclass
@@ -90,35 +91,55 @@ def _redact_json(value: Any, opts: RedactOptions) -> Any:
 
 
 def refresh_redaction(cfg: Config, state: State) -> int:
-    """Apply a changed redaction policy (for example a new deny word) to everything already
-    stored: chat text (including chats whose source files are gone), derived documents in the
-    database such as the repeated-ask report, and generated files under ``out/``. The database
-    is then compacted so no free page keeps the old text. Returns how many chats changed.
+    """Make everything already stored match the current redaction policy.
+
+    Runs when the policy changed (for example a new deny word) *or* when the state was last
+    cleaned by an older version of this tool (no or an older retention stamp). It re-redacts
+    chat text (including chats whose source files are gone), every derived document in the
+    database such as the repeated-ask report, and every generated file under ``out/``; generated
+    instruction files that no longer pass the guidance check (older versions embedded quotes in
+    them) are deleted so ``brief`` rebuilds them. The database part is one transaction and the
+    stamp is written in it, so an interrupted run repeats on the next command; every step is
+    idempotent. The database is then compacted so no free page keeps the old text. Returns how
+    many chats changed.
 
     Not touched: ``backups/``, which holds copies of your own instruction files taken by
-    ``install``."""
+    ``install``, and anything you already installed or copied elsewhere."""
     opts = cfg.redact_options()
     fingerprint = policy_fingerprint(opts)
-    if state.read_json("redaction_policy").get("fingerprint") == fingerprint:
+    if (
+        state.read_json("redaction_policy").get("fingerprint") == fingerprint
+        and state.get_meta("retention_version") == RETENTION_VERSION
+    ):
         return 0
+    out = state.root / "out"
+    if out.is_dir():
+        for path in sorted(out.rglob("*")):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            relative = path.relative_to(out).parts
+            installable = relative[0] == "skills" or relative in {("AGENTS.md",), ("CLAUDE.md.snippet",)}
+            if installable and guidance_problems(text):
+                path.unlink()
+                if path.parent != out and not any(path.parent.iterdir()):
+                    path.parent.rmdir()
+                continue
+            cleaned_text = _redact_lines(text, opts)
+            if cleaned_text != text:
+                state.write_text(path, cleaned_text)
     updates: dict[str, list[dict[str, Any]]] = {}
     for cid, chat in state.chats().items():
         messages = chat.get("messages", [])
         cleaned = [{**m, "text": redact(str(m.get("text", "")), opts)} for m in messages]
         if cleaned != messages:
             updates[cid] = cleaned
-    if updates:
-        state.update_messages(updates)
-    state.rewrite_docs(lambda value: _redact_json(value, opts), keep=("redaction_policy",))
-    out = state.root / "out"
-    if out.is_dir():
-        for path in sorted(out.rglob("*")):
-            if path.is_file() and not path.name.startswith("."):
-                text = path.read_text(encoding="utf-8", errors="replace")
-                cleaned_text = _redact_lines(text, opts)
-                if cleaned_text != text:
-                    state.write_text(path, cleaned_text)
-    state.write_json("redaction_policy", {"fingerprint": fingerprint})
+    state.apply_redaction(
+        updates,
+        lambda value: _redact_json(value, opts),
+        docs={"redaction_policy": {"fingerprint": fingerprint}},
+        meta={"retention_version": RETENTION_VERSION},
+    )
     state.vacuum()
     return len(updates)
 

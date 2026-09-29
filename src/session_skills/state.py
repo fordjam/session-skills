@@ -36,6 +36,10 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = "2"
+# Bump when stored text must be cleaned again by a newer version (the tables do not change).
+# States without this stamp, or with an older one, get a one-time re-redaction of every stored
+# message, derived document and generated file; see ``collect.refresh_redaction``.
+RETENTION_VERSION = "3"
 
 TRACKER_FIELDS = (
     "chat_id",
@@ -214,6 +218,45 @@ class State:
             raise
         return target
 
+    # -- meta --------------------------------------------------------------------------------------
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return str(row[0]) if row else None
+
+    def apply_redaction(
+        self,
+        chat_updates: dict[str, list[dict[str, Any]]],
+        transform: Callable[[Any], Any],
+        docs: dict[str, dict[str, Any]],
+        meta: dict[str, str],
+    ) -> None:
+        """One transaction: rewrite chat messages, pass every other document through
+        ``transform``, then store ``docs`` and ``meta`` (the new policy and the retention stamp).
+        Either all of it lands or none of it does, so an interrupted run simply repeats."""
+        with self.transaction() as conn:
+            for cid, messages in chat_updates.items():
+                conn.execute(
+                    "UPDATE chats SET messages = ? WHERE chat_id = ?",
+                    (json.dumps(messages, ensure_ascii=False), cid),
+                )
+            for name, data in conn.execute("SELECT name, data FROM docs").fetchall():
+                if name in docs:
+                    continue
+                value = json.loads(data)
+                new = transform(value)
+                if new != value:
+                    conn.execute(
+                        "UPDATE docs SET data = ? WHERE name = ?",
+                        (json.dumps(new, sort_keys=True, ensure_ascii=False), name),
+                    )
+            for name, value in docs.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO docs (name, data) VALUES (?, ?)",
+                    (name, json.dumps(value, sort_keys=True, ensure_ascii=False)),
+                )
+            for key, value in meta.items():
+                conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
     # -- small JSON documents ------------------------------------------------------------------
     def read_json(self, name: str) -> dict[str, Any]:
         row = self.conn.execute("SELECT data FROM docs WHERE name = ?", (name,)).fetchone()
@@ -275,34 +318,6 @@ class State:
             for cid in drop_tags:
                 conn.execute("DELETE FROM tags WHERE chat_id = ?", (cid,))
                 conn.execute("DELETE FROM part_answers WHERE chat_id = ?", (cid,))
-
-    def update_messages(self, updates: dict[str, list[dict[str, Any]]]) -> None:
-        """Rewrite stored messages (a new redaction policy) in one transaction."""
-        with self.transaction() as conn:
-            for cid, messages in updates.items():
-                conn.execute(
-                    "UPDATE chats SET messages = ? WHERE chat_id = ?",
-                    (json.dumps(messages, ensure_ascii=False), cid),
-                )
-
-    def rewrite_docs(self, transform: Callable[[Any], Any], keep: Iterable[str] = ()) -> int:
-        """Apply ``transform`` to every stored JSON document except ``keep``; return how many
-        changed. Used to re-redact derived documents when the redaction policy changes."""
-        skip = set(keep)
-        changed = 0
-        with self.transaction() as conn:
-            for name, data in conn.execute("SELECT name, data FROM docs").fetchall():
-                if name in skip:
-                    continue
-                value = json.loads(data)
-                new = transform(value)
-                if new != value:
-                    changed += 1
-                    conn.execute(
-                        "UPDATE docs SET data = ? WHERE name = ?",
-                        (json.dumps(new, sort_keys=True, ensure_ascii=False), name),
-                    )
-        return changed
 
     def vacuum(self) -> None:
         """Rewrite the database file so no free page keeps text that was replaced."""

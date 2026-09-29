@@ -20,7 +20,7 @@ from . import __version__
 from .backends import Backend, FatalBackendError, make_backend
 from .brief import brief
 from .calibrate import CalibrationError, calibrate
-from .collect import build_list
+from .collect import build_list, refresh_redaction
 from .config import Config, SourceConfig, load_config
 from .install import AGENTS, InstallError, InstallPlan, backups, install, plan_install, rollback
 from .redact import redact
@@ -279,6 +279,9 @@ def run(argv: Sequence[str] | None = None) -> int:
     state = State(cfg.state_dir)
     state.lock()
     try:
+        # every command, including install and rollback, first brings stored text up to the
+        # current redaction policy (and runs the one-time cleanup for state from older versions)
+        refresh_redaction(cfg, state)
         return _dispatch(args, cfg, state)
     finally:
         state.close()

@@ -313,18 +313,38 @@ CLASSIFIER_SYSTEM_PROMPT = (
     "with exactly one JSON object."
 )
 
-def _split_host(host: str) -> tuple[str, str, int] | None:
-    """(scheme, hostname, port) of an OLLAMA_HOST value, or None if it cannot be parsed."""
-    value = host.strip() or "127.0.0.1:11434"
-    parsed = urlsplit(value if "://" in value else f"http://{value}")
+def ollama_endpoint(raw: str) -> str | None:
+    """Resolve an OLLAMA_HOST value to one canonical ``scheme://host:port`` URL, using Ollama's
+    own defaults (no scheme: http on 11434; ``http://`` without a port: 80; ``https://``: 443).
+
+    The same string is used for the locality check *and* passed to the ``ollama`` subprocess, so
+    the server that is verified is the server that is used. Values Ollama would interpret in
+    ways we do not reproduce (a path, query, user info, another scheme) return ``None``.
+    """
+    value = raw.strip()
+    if not value:
+        return "http://127.0.0.1:11434"
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        scheme, rest, default_port = "http", value, 11434
+    elif scheme == "http":
+        default_port = 80
+    elif scheme == "https":
+        default_port = 443
+    else:
+        return None
+    parsed = urlsplit(f"{scheme}://{rest}")
     try:
         hostname = parsed.hostname
-        port = parsed.port or 11434
+        port = parsed.port if parsed.port is not None else default_port
     except ValueError:
         return None
-    if not hostname or parsed.scheme not in {"http", "https"}:
+    if not hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
         return None
-    return parsed.scheme, hostname, port
+    if parsed.path not in ("", "/"):
+        return None
+    literal = f"[{hostname}]" if ":" in hostname else hostname
+    return f"{scheme}://{literal}:{port}"
 
 
 def is_loopback(host: str) -> bool:
@@ -332,10 +352,10 @@ def is_loopback(host: str) -> bool:
     address (which clients treat as this machine), or the name ``localhost`` resolving only to
     loopback addresses. Other names are never resolved or trusted, so ``127.0.0.1.example.com``
     is rejected."""
-    parts = _split_host(host)
-    if parts is None:
+    endpoint = ollama_endpoint(host)
+    if endpoint is None:
         return False
-    hostname = parts[1]
+    hostname = urlsplit(endpoint).hostname or ""
     try:
         ip = ipaddress.ip_address(hostname)
     except ValueError:
@@ -370,15 +390,18 @@ def _ollama_show(base_url: str, model: str, timeout: float = 10.0) -> dict[str, 
 
 
 def check_ollama(model: str, allow_remote: bool) -> str:
-    """Return the OLLAMA_HOST to use, or raise if the request would leave this machine.
+    """Return the canonical OLLAMA_HOST to use, or raise if the request would leave this machine.
 
     Checks, unless ``allow_remote``: OLLAMA_HOST is a loopback address; the model name is not a
     cloud tag; and the server's ``/api/show`` confirms the model is installed locally and
     reports no ``remote_host`` / ``remote_model`` (how Ollama marks models that run elsewhere).
     """
     host = os.environ.get("OLLAMA_HOST", "")
+    endpoint = ollama_endpoint(host)
     problems = []
-    if not is_loopback(host):
+    if endpoint is None:
+        problems.append(f"OLLAMA_HOST={host!r} is not a plain scheme://host:port address")
+    elif not is_loopback(endpoint):
         problems.append(f"OLLAMA_HOST={host!r} is not a loopback address")
     if is_cloud_model(model):
         problems.append(f"{model!r} is an Ollama cloud model (it runs on Ollama's servers)")
@@ -387,12 +410,10 @@ def check_ollama(model: str, allow_remote: bool) -> str:
             "ollama would send chats off this machine: " + "; ".join(problems) + ". Use a local "
             "model and a loopback OLLAMA_HOST, or pass --allow-remote if that is what you want."
         )
+    if endpoint is None:  # only reachable with --allow-remote: pass the value through untouched
+        return host
     if not allow_remote:
-        parts = _split_host(host)
-        assert parts is not None  # is_loopback succeeded
-        scheme, hostname, port = parts
-        literal = f"[{hostname}]" if ":" in hostname else hostname
-        base = f"{scheme}://{literal}:{port}"
+        base = endpoint
         try:
             info = _ollama_show(base, model)
         except urllib.error.HTTPError as exc:
@@ -410,7 +431,7 @@ def check_ollama(model: str, allow_remote: bool) -> str:
             raise FatalBackendError(
                 f"ollama reports that {model!r} runs remotely ({remote}); pass --allow-remote if that is what you want"
             )
-    return host or "127.0.0.1:11434"
+    return endpoint
 
 
 def _claude(spec: str, model: str, timeout: float, pass_env: Sequence[str]) -> CommandBackend:

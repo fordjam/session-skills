@@ -144,9 +144,13 @@ database or directory, or open an issue.
   digits (cards, accounts), money amounts (`$N`), home-directory user names (`/Users/<name>`
   becomes `~`), `.env` contents, and pasted blocks. Every prompt is rebuilt from the stored chat
   and redacted again with the **current** policy immediately before it is sent. When you change
-  the policy (say, add a deny word), the next command re-redacts everything it has stored: chat
-  text (including chats whose source files are gone), derived documents in the database such as
-  the repeated-ask report, and generated files under `out/`. The database is then compacted
+  the policy (say, add a deny word), the next `session-skills` command of any kind, `install` and
+  `rollback` included, first re-redacts everything it has stored: chat text (including chats
+  whose source files are gone), derived documents in the database such as the repeated-ask
+  report, and generated files under `out/`. A state directory last cleaned by an older release
+  of this tool gets the same pass once, and generated instruction files from older releases that
+  embedded quotes are deleted so `brief` rebuilds them. The database part is one transaction
+  with a version stamp, so an interrupted cleanup simply repeats. The database is then compacted
   (`VACUUM`, with `secure_delete` on) so no free page keeps the old text. Not covered: copies you
   already installed, shared or backed up elsewhere, and `backups/`, which holds copies of your own
   instruction files taken by `install`.
@@ -182,6 +186,9 @@ database or directory, or open an issue.
   - `ollama`: unless you pass `--allow-remote`, three checks must pass before any chat is sent:
     `OLLAMA_HOST` is a loopback IP literal (`127.0.0.0/8`, `::1`) or `localhost` resolving only to
     loopback addresses (other names are never trusted, so `127.0.0.1.example.com` is refused);
+    it is resolved once to a canonical `scheme://host:port` with Ollama's own defaults (port 11434
+    without a scheme, 80 for `http://`, 443 for `https://`; values with a path or credentials are
+    refused), and that exact string is both checked and passed to `ollama` as `OLLAMA_HOST`;
     the model name is not a cloud tag (`:cloud`, `-cloud`); and the server's `/api/show` lists the
     model as installed and reports no `remote_host` / `remote_model`, which is how Ollama marks a
     model that runs elsewhere. Proxy variables are not passed to `ollama`. Limit: these checks

@@ -146,7 +146,7 @@ def test_no_backend_gets_write_or_shell_capability(spec, fake_path, tmp_path, mo
         assert env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1" and call["auth_link"]
         assert not Path(env["XDG_DATA_HOME"]).exists()
     elif spec.startswith("ollama"):
-        assert argv == ["run", "--nowordwrap", "llama3.2"] and env["OLLAMA_HOST"] == "127.0.0.1:11434"
+        assert argv == ["run", "--nowordwrap", "llama3.2"] and env["OLLAMA_HOST"] == "http://127.0.0.1:11434"
         assert info["destination"] == "local"
 
 
@@ -471,3 +471,38 @@ def test_ollama_model_that_is_missing_or_remote_is_refused(monkeypatch):
     with pytest.raises(FatalBackendError, match="could not reach"):
         make_backend("ollama:llama3.2")
     assert make_backend("ollama:llama3.2", allow_remote=True).describe()["destination"] == "remote"
+
+
+# -- round 3: the endpoint that is verified is the endpoint that is used ------------------------
+
+@pytest.mark.parametrize(("raw", "canonical"), [
+    ("", "http://127.0.0.1:11434"),
+    ("127.0.0.1", "http://127.0.0.1:11434"),
+    ("127.0.0.1:8080", "http://127.0.0.1:8080"),
+    ("http://127.0.0.1", "http://127.0.0.1:80"),  # round-3 reviewer: Ollama uses port 80 here
+    ("https://localhost", "https://localhost:443"),
+    ("http://[::1]:11434/", "http://[::1]:11434"),
+])
+def test_ollama_checks_and_runs_the_same_endpoint(raw, canonical, fake_path, monkeypatch, local_ollama):
+    bin_dir, log = fake_path
+    fake_cli(bin_dir, "ollama", f"print({json.dumps(json.dumps(ANSWER))})\n", log)
+    monkeypatch.setenv("OLLAMA_HOST", raw)
+    backend = make_backend("ollama:llama3.2", local_only=True)
+    monkeypatch.setenv("OLLAMA_HOST", "http://10.9.9.9:11434")  # changing it afterwards changes nothing
+    backend.complete("p")
+    checked = [base for base, _ in local_ollama]
+    used = calls(log)[0]["env"]["OLLAMA_HOST"]
+    assert checked == [canonical] and used == canonical
+
+
+@pytest.mark.parametrize("raw", [
+    "http://127.0.0.1:11434/some/prefix",  # round-3 reviewer: paths were dropped for the check only
+    "http://127.0.0.1:11434/?x=1",
+    "http://user:pw@127.0.0.1:11434",
+    "tcp://127.0.0.1:11434",
+])
+def test_ollama_hosts_we_cannot_canonicalise_are_refused(raw, monkeypatch, local_ollama):
+    monkeypatch.setenv("OLLAMA_HOST", raw)
+    with pytest.raises(FatalBackendError, match="scheme://host:port"):
+        make_backend("ollama:llama3.2")
+    assert local_ollama == []

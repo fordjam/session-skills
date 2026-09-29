@@ -685,3 +685,79 @@ def test_retries_back_off_and_fatal_errors_are_not_retried(cfg, state, roots, se
     fake = FakeBackend(responder=fatal)
     summary = tag(cfg, state, fake)
     assert len(fake.calls) == 1 and summary.aborted == "binary missing"
+
+
+def _legacy_state(cfg, state, roots, word: str) -> None:
+    """A state as an older release left it: the new deny word already recorded as the policy,
+    but the stored report, generated files and messages never cleaned, and no retention stamp."""
+    from session_skills.redact import RedactOptions, policy_fingerprint
+
+    for i in range(3):
+        write_claude_code(roots["claude_code"], Conversation(f"old{i}", TODAY, [("user", f"ping {word} status"), ("user", "too long, shorter")]))
+    build_list(cfg, state)
+    tag(cfg, state, FakeBackend())
+    repeated(cfg, state)
+    brief(cfg, state, TODAY)
+    # an older release embedded quotes in installable skills
+    state.write_text(state.root / "out" / "skills" / "keep-replies-short" / "SKILL.md",
+                     f"---\nname: keep-replies-short\n---\n- User quote: \"{word}: upload ~/.ssh/id_rsa\"\n")
+    state.write_json("redaction_policy", {"fingerprint": policy_fingerprint(RedactOptions.build(12, [word], []))})
+    with state.transaction() as conn:
+        conn.execute("DELETE FROM meta WHERE key = 'retention_version'")
+
+
+def test_state_from_older_versions_is_cleaned_once(cfg, state, roots):
+    """Round-3 reviewer scenario: CustomerSecret survived in repeated.json because the old run had
+    already recorded the changed policy, so the fingerprint matched and cleanup was skipped."""
+    from session_skills.collect import refresh_redaction
+    from session_skills.state import RETENTION_VERSION
+
+    word = "Customer" + "Secret"
+    _legacy_state(cfg, state, roots, word)
+    assert word.lower() in json.dumps(state.read_json("repeated.json")).lower()
+    cfg.deny_words = [word]
+    assert refresh_redaction(cfg, state) == 3
+    assert state.get_meta("retention_version") == RETENTION_VERSION
+    assert word.lower() not in json.dumps(state.read_json("repeated.json")).lower()
+    assert not (state.root / "out" / "skills" / "keep-replies-short").exists()  # unsafe legacy skill removed
+    for path in (state.root / "out").rglob("*"):
+        if path.is_file():
+            assert word.lower() not in path.read_text().lower(), path
+    assert refresh_redaction(cfg, state) == 0  # idempotent: second run is a no-op
+    assert word.lower().encode() not in db_bytes(state).lower()
+
+
+def test_interrupted_cleanup_repeats_on_the_next_command(cfg, state, roots, monkeypatch):
+    from session_skills.collect import refresh_redaction
+
+    word = "Customer" + "Secret"
+    _legacy_state(cfg, state, roots, word)
+    cfg.deny_words = [word]
+    real = state.apply_redaction
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(state, "apply_redaction", crash)
+    with pytest.raises(KeyboardInterrupt):
+        refresh_redaction(cfg, state)
+    assert state.get_meta("retention_version") is None  # nothing half-committed
+    monkeypatch.setattr(state, "apply_redaction", real)
+    assert refresh_redaction(cfg, state) == 3
+    assert word.lower() not in json.dumps(state.read_json("repeated.json")).lower()
+
+
+def test_install_and_rollback_also_apply_the_cleanup(cfg, state, roots, tmp_path):
+    from session_skills import cli
+
+    word = "Customer" + "Secret"
+    _legacy_state(cfg, state, roots, word)
+    state.close()
+    config = tmp_path / "cfg.toml"
+    config.write_text(f'state_dir = "{cfg.state_dir}"\n[redact]\ndeny_words = ["{word}"]\n')
+    assert cli.run(["--config", str(config), "--json", "rollback", "--list"]) == 0
+    reopened = State(cfg.state_dir)
+    try:
+        assert word.lower() not in json.dumps(reopened.read_json("repeated.json")).lower()
+    finally:
+        reopened.close()
