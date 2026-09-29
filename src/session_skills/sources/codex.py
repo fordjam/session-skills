@@ -15,8 +15,9 @@ from __future__ import annotations
 import glob
 import json
 import os
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 from .base import Message, Session, clean_human_text, clip_assistant, finish, iso_date, sha256_bytes
 
@@ -52,14 +53,15 @@ def _is_subagent(meta: dict[str, Any]) -> bool:
     return isinstance(source, str) and "subagent" in source.lower()
 
 
-def parse_lines(lines: Sequence[str]) -> tuple[list[Message], str, bool]:
-    """Return (messages, started_date, is_subagent)."""
+def parse_lines(lines: Sequence[str]) -> tuple[list[Message], str, bool, str]:
+    """Return (messages, started_date, is_subagent, session_id)."""
     typed: list[Message] = []
     item_users: list[Message] = []
     assistants: list[Message] = []
     order: list[tuple[str, int]] = []  # interleave in file order
     started = ""
     subagent = False
+    session_id = ""
     for line in lines:
         try:
             event = json.loads(line)
@@ -73,11 +75,13 @@ def parse_lines(lines: Sequence[str]) -> tuple[list[Message], str, bool]:
         if kind == "session_meta" and payload is not None:
             started = started or iso_date(payload.get("timestamp") or stamp)
             subagent = subagent or _is_subagent(payload)
+            session_id = session_id or str(payload.get("id") or "")
             continue
         if payload is None and "type" in event and "role" in event:
             payload, kind = event, "response_item"  # legacy rollout line
         elif payload is None and "instructions" in event and "id" in event:
             started = started or iso_date(event.get("timestamp"))
+            session_id = session_id or str(event.get("id") or "")
             continue
         if payload is None:
             continue
@@ -110,7 +114,7 @@ def parse_lines(lines: Sequence[str]) -> tuple[list[Message], str, bool]:
             messages.append(typed[index])
         elif bucket == "item" and not use_typed:
             messages.append(item_users[index])
-    return messages, started, subagent
+    return messages, started, subagent, session_id
 
 
 class CodexAdapter:
@@ -118,6 +122,7 @@ class CodexAdapter:
 
     def __init__(self, paths: Sequence[str] | None = None):
         self.paths = list(paths) if paths else default_paths()
+        self.warnings: list[str] = []
 
     def files(self) -> list[Path]:
         found: set[Path] = set()
@@ -132,12 +137,14 @@ class CodexAdapter:
         for path in self.files():
             try:
                 raw = path.read_bytes()
-            except OSError:
+            except OSError as exc:
+                self.warnings.append(f"codex: could not read {path.name}: {exc.strerror or exc}")
                 continue
-            messages, started, subagent = parse_lines(raw.decode("utf-8", errors="replace").splitlines())
+            messages, started, subagent, session_id = parse_lines(raw.decode("utf-8", errors="replace").splitlines())
             if subagent:
                 continue
-            session = Session(NAME, str(path), sha256_bytes(raw), messages, started)
+            # the rollout id survives a move into archived_sessions; the path does not
+            session = Session(NAME, session_id or str(path), sha256_bytes(raw), messages, started)
             done = finish(session)
             if done:
                 yield done

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from .config import Config
-from .redact import RedactOptions, redact
+from .redact import RedactOptions, policy_fingerprint, redact
 from .sources import Adapter, Session, make_adapter
 from .state import State, chat_id
 
@@ -17,8 +18,11 @@ class BuildSummary:
     new: int = 0
     changed: int = 0
     unchanged: int = 0
+    duplicates: int = 0
     total: int = 0
     chars: int = 0
+    re_redacted: int = 0
+    warnings: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -26,8 +30,11 @@ class BuildSummary:
             "new": self.new,
             "changed": self.changed,
             "unchanged": self.unchanged,
+            "duplicates": self.duplicates,
             "total_chats": self.total,
+            "re_redacted": self.re_redacted,
             "estimated_input_tokens": self.chars // 4,
+            "warnings": self.warnings,
         }
 
 
@@ -66,6 +73,31 @@ def redact_session(session: Session, opts: RedactOptions) -> list[dict[str, Any]
     ]
 
 
+def event_dates(messages: Sequence[dict[str, Any]], fallback: str) -> tuple[str, str]:
+    """(first, last) message date; a chat's recency is its latest message, not its start."""
+    dates = sorted(str(m.get("date") or "") for m in messages if m.get("date"))
+    return (dates[0] if dates else fallback, dates[-1] if dates else fallback)
+
+
+def refresh_redaction(cfg: Config, state: State) -> int:
+    """Re-redact every stored chat when the redaction policy changed (for example a new deny
+    word). Chats whose source files are gone are fixed too. Returns how many chats changed."""
+    opts = cfg.redact_options()
+    fingerprint = policy_fingerprint(opts)
+    if state.read_json("redaction_policy").get("fingerprint") == fingerprint:
+        return 0
+    updates: dict[str, list[dict[str, Any]]] = {}
+    for cid, chat in state.chats().items():
+        messages = chat.get("messages", [])
+        cleaned = [{**m, "text": redact(str(m.get("text", "")), opts)} for m in messages]
+        if cleaned != messages:
+            updates[cid] = cleaned
+    if updates:
+        state.update_messages(updates)
+    state.write_json("redaction_policy", {"fingerprint": fingerprint})
+    return len(updates)
+
+
 def adapters_for(cfg: Config, only: Sequence[str] = ()) -> list[Adapter]:
     result = []
     for name, source in cfg.sources.items():
@@ -78,52 +110,63 @@ def adapters_for(cfg: Config, only: Sequence[str] = ()) -> list[Adapter]:
 
 
 def build_list(cfg: Config, state: State, only: Sequence[str] = ()) -> BuildSummary:
+    state.lock()
+    summary = BuildSummary()
+    summary.re_redacted = refresh_redaction(cfg, state)
     opts = cfg.redact_options()
     tracker = state.tracker()
-    chats = state.chats()
-    tags = state.tags()
-    summary = BuildSummary()
+    # One chat per session id. The same session found twice (a rollout copied into
+    # archived_sessions, say) keeps the longer copy.
+    sessions: dict[str, Session] = {}
     for adapter in adapters_for(cfg, only):
         count = 0
         for session in adapter.iter_sessions():
             count += 1
             cid = chat_id(session.source, session.key)
-            messages = redact_session(session, opts)
-            lines = render(messages)
-            chars = sum(len(line) + 1 for line in lines)
-            prior = tracker.get(cid)
-            if prior and prior.get("file_hash") == session.fingerprint:
-                summary.unchanged += 1
-                status, flagged, note = prior.get("status", "new"), prior.get("flagged", ""), prior.get("note", "")
-            else:
-                if prior:
-                    summary.changed += 1
-                    tags.pop(cid, None)  # answers were for an older version of the chat
-                else:
-                    summary.new += 1
-                status, flagged, note = "new", "", ""
-            tracker[cid] = {
-                "chat_id": cid,
-                "source": session.source,
-                "file_hash": session.fingerprint,
-                "date": session.started,
-                "human_messages": str(len(session.human_messages)),
-                "chars": str(chars),
-                "parts": str(len(split_parts(lines, cfg.max_chars))),
-                "status": status,
-                "flagged": flagged,
-                "note": note,
-            }
-            chats[cid] = {
-                "chat_id": cid,
-                "source": session.source,
-                "date": session.started,
-                "messages": messages,
-            }
+            prior = sessions.get(cid)
+            if prior is not None:
+                summary.duplicates += 1
+                if len(prior.messages) >= len(session.messages):
+                    continue
+            sessions[cid] = session
         summary.found[adapter.name] = count
+        summary.warnings.extend(getattr(adapter, "warnings", []))
+    rows: dict[str, dict[str, str]] = {}
+    chats: dict[str, dict[str, Any]] = {}
+    changed: list[str] = []
+    for cid, session in sorted(sessions.items()):
+        messages = redact_session(session, opts)
+        lines = render(messages)
+        first, last = event_dates(messages, session.started)
+        prior_row = tracker.get(cid)
+        if prior_row and prior_row.get("file_hash") == session.fingerprint:
+            summary.unchanged += 1
+            status = prior_row.get("status", "new")
+            flagged, note = prior_row.get("flagged", ""), prior_row.get("note", "")
+        else:
+            if prior_row:
+                summary.changed += 1
+                changed.append(cid)  # answers were for an older version of the chat
+            else:
+                summary.new += 1
+            status, flagged, note = "new", "", ""
+        rows[cid] = {
+            "chat_id": cid,
+            "source": session.source,
+            "file_hash": session.fingerprint,
+            "date": first,
+            "last_date": last,
+            "human_messages": str(len(session.human_messages)),
+            "chars": str(sum(len(line) + 1 for line in lines)),
+            "parts": str(len(split_parts(lines, cfg.max_chars))),
+            "status": status,
+            "flagged": flagged,
+            "note": note,
+        }
+        chats[cid] = {"messages": messages}
+    state.save_corpus(rows, chats, drop_tags=changed)
+    tracker = state.tracker()
     summary.total = len(tracker)
     summary.chars = sum(int(r.get("chars") or 0) for r in tracker.values() if r.get("status") != "tagged")
-    state.save_chats(chats)
-    state.save_tracker(tracker)
-    state.save_tags(tags)
+    state.export_tracker()
     return summary

@@ -5,26 +5,38 @@ pure (no I/O, no randomness) and idempotent: ``redact(redact(x)) == redact(x)``.
 
 What it removes, in order:
 
-1. PEM private-key blocks.
+1. PEM / PGP / PuTTY private-key blocks.
 2. Pasted blocks: ``<pasted_content>`` tags, fenced code blocks longer than ``max_block_lines``,
    and unfenced runs of ``max_block_lines`` or more consecutive non-empty lines.
 3. ``.env`` contents: fenced env/dotenv blocks, ``NAME=value`` lines whose name looks secret, and
    every ``NAME=value`` line in a message that mentions ``.env``.
-4. Credentials in URLs (``scheme://user:pass@``) and secret-looking query parameters.
-5. API keys and tokens: well-known prefixes, JWTs, ``Bearer``/``Basic`` values, and generic
+   Secret-named keys in any assignment or dict syntax (``password=..``, ``db_password: ..``,
+   ``{'password': '..'}``, ``"api_key" => ".."``), including connection-string fields such as
+   ``Pwd=`` and ``AccountKey=``.
+4. Credentials in URLs (``scheme://user:pass@``, ``scheme://:pass@``) and secret-looking query
+   parameters.
+5. HTTP credential headers: ``Authorization``, ``Proxy-Authorization``, ``Cookie``,
+   ``Set-Cookie`` and ``X-...-Key/Token/Secret`` values, to the end of the line.
+6. API keys and tokens: well-known prefixes, JWTs, ``Bearer``/``Basic`` values, and generic
    high-entropy strings (32+ chars mixing upper, lower and digits, or 32+ hex digits).
-6. Email addresses.
-7. Home-directory user names (``/Users/<name>``, ``/home/<name>``, ``C:\\Users\\<name>`` -> ``~``).
-8. Money amounts (``$1,234.50`` -> ``$N``; also GBP and EUR symbols).
-9. Runs of 12-19 digits, optionally separated by spaces or dashes (cards, accounts).
-10. Any user-configured deny words or extra regular expressions.
+7. Email addresses.
+8. Home-directory user names (``/Users/<name>``, ``/home/<name>``, ``C:\\Users\\<name>`` -> ``~``).
+9. Money amounts (``$1,234.50`` -> ``$N``; also GBP and EUR symbols).
+10. Runs of 12-19 digits, optionally separated by spaces or dashes (cards, accounts).
+11. Any user-configured deny words or extra regular expressions.
+
+``policy_fingerprint`` identifies a redaction policy. The pipeline stores it and re-redacts every
+stored chat when it changes, and every prompt is redacted again with the *current* policy right
+before it is sent.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 KEY = "[REDACTED:key]"
 EMAIL = "[REDACTED:email]"
@@ -33,6 +45,11 @@ ENV = "[REDACTED:env]"
 CRED = "[REDACTED:cred]"
 PRIVATE_KEY = "[REDACTED:private-key]"
 CUSTOM = "[REDACTED:custom]"
+AUTH = "[REDACTED:auth]"
+COOKIE = "[REDACTED:cookie]"
+
+# Bump when the built-in patterns change, so stored chats are re-redacted.
+REDACTOR_VERSION = "2"
 PASTED_TAG = "[PASTED BLOCK]"
 
 
@@ -41,9 +58,11 @@ def pasted(lines: int) -> str:
 
 
 _PEM = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?"
+    r"(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\Z)",
     re.DOTALL,
 )
+_PUTTY = re.compile(r"(?is)PuTTY-User-Key-File-\d+:.*?(?:Private-MAC:\s*\S+|\Z)")
 _PASTED_TAG = re.compile(
     r"<pasted[_-]content\b[^>]*>.*?(?:</pasted[_-]content>|\Z)", re.IGNORECASE | re.DOTALL
 )
@@ -58,14 +77,30 @@ _VALUE = r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s,;&`]+)"
 _SECRET_ASSIGN = re.compile(
     r"(?<![A-Za-z0-9_])((?:export\s+)?" + _SECRET_NAME + r"\s*[:=]\s*)" + _VALUE
 )
+_LOWER_SECRET_NAMES = (
+    r"(?:api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|password|passwd|passphrase|pwd|"
+    r"(?:access|auth|refresh|api|id|session|bearer)[_-]?token|token|access[_-]?key|private[_-]?key|"
+    r"account[_-]?key|shared[_-]?access[_-]?(?:key|signature)|session[_-]?(?:id|key)|sessid|"
+    r"credentials?|cookie|dsn|connection[_-]?string|conn[_-]?str)"
+)
 _SECRET_ASSIGN_LOWER = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])((?:api[_-]?key|secret|client[_-]?secret|password|passwd|"
-    r"(?:access|auth|refresh|api)[_-]?token|token)\s*[:=]\s*)" + _VALUE
+    r"(?i)(?<![A-Za-z0-9])((?:[A-Za-z0-9]+[_.-])*" + _LOWER_SECRET_NAMES + r"(?![A-Za-z0-9])"
+    r"\s*(?::|=>|=)\s*)" + _VALUE
 )
 _JSON_SECRET = re.compile(
     r"(?i)(\"(?:" + _SECRET_NAME + r")\"\s*:\s*)\"[^\"\n]*\""
 )
-_URL_CRED = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@")
+# {'password': 'x'}, {"db_password" => "x"}, ["token"] = 'x'
+_QUOTED_SECRET = re.compile(
+    r"(?i)(([\"'])(?:[A-Za-z0-9]+[_.-])*" + _LOWER_SECRET_NAMES + r"\2\]?\s*(?::|=>|=)\s*)"
+    r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,;}\]]+)"
+)
+_URL_CRED = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@")
+_AUTH_LINE = re.compile(r"(?im)\b((?:proxy-)?authorization\s*:\s*+)(?!\[REDACTED)[^\n'\"]+")
+_COOKIE_LINE = re.compile(r"(?im)\b((?:set-)?cookie\s*:\s*+)(?!\[REDACTED)[^\n'\"]+")
+_X_HEADER = re.compile(
+    r"(?im)\b(x-[a-z0-9-]*(?:key|token|secret|auth|signature|session)[a-z0-9-]*\s*:\s*+)(?!\[REDACTED)[^\n'\"]+"
+)
 _QUERY_SECRET = re.compile(
     r"(?i)([?&](?:access_token|token|api_key|apikey|key|secret|password|pass|sig|signature|auth|code)=)"
     r"[^&\s#]+"
@@ -86,7 +121,7 @@ _KNOWN_TOKENS = re.compile(
     r"|whsec_[A-Za-z0-9]{16,}"
     r"|lin_api_[A-Za-z0-9]{16,}"
     r"|shp(?:at|ss|ca)_[A-Za-z0-9]{16,}"
-    r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
     r")"
 )
 _AUTH_HEADER = re.compile(r"(?i)\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+/=-]{12,}")
@@ -114,7 +149,7 @@ class RedactOptions:
         max_block_lines: int = 12,
         deny_words: Iterable[str] = (),
         extra_patterns: Iterable[str] = (),
-    ) -> "RedactOptions":
+    ) -> RedactOptions:
         words = tuple(w for w in deny_words if w.strip())
         extras = tuple(extra_patterns)
         compiled = tuple(re.compile(re.escape(w), re.IGNORECASE) for w in words) + tuple(
@@ -124,6 +159,14 @@ class RedactOptions:
 
 
 DEFAULT_OPTIONS = RedactOptions()
+
+
+def policy_fingerprint(opts: RedactOptions) -> str:
+    """Identify a redaction policy (built-in version plus user settings)."""
+    blob = json.dumps(
+        [REDACTOR_VERSION, opts.max_block_lines, list(opts.deny_words), list(opts.extra_patterns)]
+    )
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
 def _fences(text: str, opts: RedactOptions) -> str:
@@ -170,9 +213,10 @@ def _env(text: str) -> str:
     if ".env" in text.lower():
         text = _ENV_ASSIGN_LINE.sub(lambda m: m.group(1) + ENV, text)
     text = _JSON_SECRET.sub(lambda m: m.group(1) + '"' + ENV + '"', text)
+    text = _QUOTED_SECRET.sub(lambda m: m.group(1) + m.group(2) + ENV + m.group(2), text)
     for pattern in (_SECRET_ASSIGN, _SECRET_ASSIGN_LOWER):
         text = pattern.sub(
-            lambda m: m.group(0) if m.group(2).startswith(("[REDACTED", '"[REDACTED'))
+            lambda m: m.group(0) if m.group(2).lstrip("\"'").startswith("[REDACTED")
             else m.group(1) + ENV,
             text,
         )
@@ -201,11 +245,15 @@ def redact(text: str | None, opts: RedactOptions = DEFAULT_OPTIONS) -> str:
         return ""
     value = str(text).replace("\r\n", "\n")
     value = _PEM.sub(PRIVATE_KEY, value)
+    value = _PUTTY.sub(PRIVATE_KEY, value)
     value = _PASTED_TAG.sub(PASTED_TAG, value)
     value = _fences(value, opts)
     value = _long_runs(value, opts)
     value = _URL_CRED.sub(lambda m: m.group(1) + CRED + "@", value)
     value = _QUERY_SECRET.sub(lambda m: m.group(1) + CRED, value)
+    value = _AUTH_LINE.sub(lambda m: m.group(1) + AUTH, value)
+    value = _COOKIE_LINE.sub(lambda m: m.group(1) + COOKIE, value)
+    value = _X_HEADER.sub(lambda m: m.group(1) + AUTH, value)
     value = _env(value)
     value = _KNOWN_TOKENS.sub(KEY, value)
     value = _AUTH_HEADER.sub(lambda m: m.group(1) + m.group(2) + KEY, value)

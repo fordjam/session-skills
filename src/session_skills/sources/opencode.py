@@ -29,8 +29,9 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 from .base import Message, Session, clean_human_text, clip_assistant, finish, iso_date
 
@@ -83,15 +84,18 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def read_sqlite(path: Path) -> Iterator[Session]:
+def read_sqlite(path: Path, warnings: list[str] | None = None) -> Iterator[Session]:
+    notes = warnings if warnings is not None else []
     uri = f"file:{path}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        notes.append(f"opencode: could not open {path.name}: {exc}")
         return
     try:
         cols = _columns(conn, "session")
         if not cols or not _columns(conn, "message") or not _columns(conn, "part"):
+            notes.append(f"opencode: skipped {path.name}: no session/message/part tables (not an OpenCode database?)")
             return
         parent = "parent_id" if "parent_id" in cols else "NULL"
         updated = "time_updated" if "time_updated" in cols else "0"
@@ -120,13 +124,12 @@ def read_sqlite(path: Path) -> Iterator[Session]:
                 message = _message_from_parts(info.get("role"), parts, iso_date(msg_created))
                 if message:
                     messages.append(message)
-            session = Session(
-                NAME, f"{path}#{session_id}", digest.hexdigest(), messages, iso_date(created)
-            )
+            session = Session(NAME, str(session_id), digest.hexdigest(), messages, iso_date(created))
             done = finish(session)
             if done:
                 yield done
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        notes.append(f"opencode: error reading {path.name} (schema changed?): {exc}")
         return
     finally:
         conn.close()
@@ -157,9 +160,7 @@ def read_storage(root: Path) -> Iterator[Session]:
             if message:
                 messages.append(message)
         time: dict[str, Any] = info["time"] if isinstance(info.get("time"), dict) else {}
-        session = Session(
-            NAME, f"{root}#{session_id}", digest.hexdigest(), messages, iso_date(time.get("created"))
-        )
+        session = Session(NAME, session_id, digest.hexdigest(), messages, iso_date(time.get("created")))
         done = finish(session)
         if done:
             yield done
@@ -177,6 +178,7 @@ class OpenCodeAdapter:
 
     def __init__(self, paths: Sequence[str] | None = None):
         self.paths = list(paths) if paths else default_paths()
+        self.warnings: list[str] = []
 
     def targets(self) -> list[tuple[str, Path]]:
         found: dict[Path, str] = {}
@@ -191,4 +193,4 @@ class OpenCodeAdapter:
 
     def iter_sessions(self) -> Iterator[Session]:
         for kind, path in self.targets():
-            yield from read_sqlite(path) if kind == "sqlite" else read_storage(path)
+            yield from read_sqlite(path, self.warnings) if kind == "sqlite" else read_storage(path)

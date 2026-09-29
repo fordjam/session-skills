@@ -168,3 +168,43 @@ def test_clean_human_text_and_dates():
     assert iso_date(1_788_000_000_000) == iso_date(1_788_000_000)
     assert iso_date("2026-09-01T23:00:00Z") == "2026-09-01"
     assert iso_date("garbage") == ""
+
+
+def test_unreadable_opencode_database_is_reported_not_silently_dropped(tmp_path: Path, cfg, state, capsys):
+    from session_skills import cli
+    from session_skills.collect import build_list
+
+    broken = tmp_path / "opencode" / "opencode.db"
+    broken.parent.mkdir(parents=True)
+    broken.write_bytes(b"this is not a sqlite database at all" * 100)
+    adapter = make_adapter("opencode", [str(broken)])
+    assert list(adapter.iter_sessions()) == []
+    assert adapter.warnings and "opencode.db" in adapter.warnings[0]
+
+    summary = build_list(cfg, state)
+    assert any("opencode.db" in w for w in summary.warnings)
+    state.close()
+    code = cli.run(["--state-dir", str(cfg.state_dir), "build-list", "--path", f"opencode={broken}", "--source", "opencode"])
+    assert code == 1 and "warning: opencode" in capsys.readouterr().out
+
+
+def test_unrelated_sqlite_is_noted_but_not_an_error(tmp_path: Path):
+    import sqlite3
+
+    db = tmp_path / "other.db"
+    sqlite3.connect(db).execute("CREATE TABLE t (x)").connection.close()
+    adapter = make_adapter("opencode", [str(db)])
+    assert list(adapter.iter_sessions()) == []
+    assert adapter.warnings and ": skipped " in adapter.warnings[0]
+
+
+def test_session_keys_are_native_ids_not_paths(tmp_path: Path):
+    write_codex(tmp_path, Conversation("rollout-id-1", DAY, [("user", "hello")]))
+    session = only(make_adapter("codex", [str(tmp_path / "sessions" / "**" / "*.jsonl")]))
+    assert session.key == "rollout-id-1"
+    root = tmp_path / "projects"
+    write_claude_code(root, Conversation("0000-uuid", DAY, [("user", "hello")]))
+    assert only(make_adapter("claude_code", [str(root / "**" / "*.jsonl")])).key == "0000-uuid"
+    db = tmp_path / "opencode.db"
+    write_opencode_db(db, [Conversation("ses_x", DAY, [("user", "hello")])])
+    assert only(make_adapter("opencode", [str(db)])).key == "ses_x"

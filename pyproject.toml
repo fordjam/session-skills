@@ -26,7 +26,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "mypy>=1.10"]
+dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.6"]
 
 [project.scripts]
 session-skills = "session_skills.cli:main"
@@ -42,3 +42,16 @@ addopts = "-q"
 python_version = "3.11"
 strict = true
 files = ["src/session_skills"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "DTZ", "FURB"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+# fixture corpora and the question table are data; wrapping them hurts readability
+"src/session_skills/synthetic.py" = ["E501"]
+"src/session_skills/questions.py" = ["E501"]

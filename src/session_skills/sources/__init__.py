@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Sequence, cast
+from collections.abc import Sequence
+from typing import cast
 
-from .base import Adapter, Message, Session, TOOL_MARKER
+from .base import TOOL_MARKER, Adapter, Message, Session
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .opencode import OpenCodeAdapter
@@ -24,4 +25,4 @@ def make_adapter(name: str, paths: Sequence[str] | None = None) -> Adapter:
     return cast(Adapter, cls(paths))
 
 
-__all__ = ["ADAPTERS", "Adapter", "Message", "Session", "TOOL_MARKER", "make_adapter"]
+__all__ = ["ADAPTERS", "TOOL_MARKER", "Adapter", "Message", "Session", "make_adapter"]

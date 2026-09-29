@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Iterator, Literal, Protocol
+from datetime import UTC, datetime
+from typing import Literal, Protocol
 
 Role = Literal["user", "assistant"]
 
@@ -50,8 +51,9 @@ class Message:
 
 @dataclass
 class Session:
-    """One chat. ``key`` is a stable, private identifier (e.g. a file path) that is only ever
-    stored hashed."""
+    """One chat. ``key`` is a stable, private identifier that is only ever stored hashed: the
+    agent's own session id when the format has one (so moving or archiving the file does not
+    create a second chat), otherwise the file path."""
 
     source: str
     key: str
@@ -66,6 +68,7 @@ class Session:
 
 class Adapter(Protocol):
     name: str
+    warnings: list[str]  # problems reading sources (reported, never silently dropped)
 
     def iter_sessions(self) -> Iterator[Session]: ...
 
@@ -103,12 +106,12 @@ def iso_date(value: object) -> str:
     if isinstance(value, (int, float)):
         seconds = value / 1000 if value > 10_000_000_000 else value
         try:
-            return datetime.fromtimestamp(seconds, timezone.utc).date().isoformat()
+            return datetime.fromtimestamp(seconds, UTC).date().isoformat()
         except (OverflowError, OSError, ValueError):
             return ""
     if isinstance(value, str) and value:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+            return datetime.fromisoformat(value).date().isoformat()
         except ValueError:
             return value[:10] if re.match(r"\d{4}-\d{2}-\d{2}", value) else ""
     return ""

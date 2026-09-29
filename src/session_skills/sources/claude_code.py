@@ -12,8 +12,9 @@ from __future__ import annotations
 import glob
 import json
 import os
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 from .base import Message, Session, clean_human_text, clip_assistant, finish, sha256_bytes
 
@@ -82,6 +83,7 @@ class ClaudeCodeAdapter:
 
     def __init__(self, paths: Sequence[str] | None = None):
         self.paths = list(paths) if paths else default_paths()
+        self.warnings: list[str] = []
 
     def files(self) -> list[Path]:
         found: set[Path] = set()
@@ -101,10 +103,13 @@ class ClaudeCodeAdapter:
         for path in self.files():
             try:
                 raw = path.read_bytes()
-            except OSError:
+            except OSError as exc:
+                self.warnings.append(f"claude_code: could not read {path.name}: {exc.strerror or exc}")
                 continue
             lines = raw.decode("utf-8", errors="replace").splitlines()
-            session = Session(NAME, str(path), sha256_bytes(raw), parse_lines(lines))
+            # the file name is the session id: stable across moves, unlike the path
+            key = path.stem
+            session = Session(NAME, key, sha256_bytes(raw), parse_lines(lines))
             done = finish(session)
             if done:
                 yield done

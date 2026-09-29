@@ -1,29 +1,48 @@
-"""Private, resumable state: a 0700 directory outside any repository, files written 0600.
+"""Private, resumable, transactional state.
 
-Files:
-  chats.jsonl         redacted messages per chat (never raw text)
-  tracker.csv         one row per chat: status new/tagged/failed, flagged, note
-  tags.jsonl          per-chat answers from the tagging backend (missing = not tagged, never 0)
-  labels.jsonl        second-backend labels for the calibration sample
-  calibration.json    per-question agreement and threshold
-  repeated.json       repeated-ask clusters
-  out/                report.md, skills/, AGENTS.md block, CLAUDE.md snippet
+Everything lives in one SQLite database, ``state.db``, inside a 0700 directory that must be
+outside any repository. The database file is 0600 and uses ``secure_delete`` so text removed by a
+later redaction pass is overwritten on disk rather than left in free pages.
+
+Tables:
+  chats         one row per chat: redacted messages, dates, tracker status (new / partial /
+                tagged / failed), flag and note
+  tags          per-chat answers from the tagging backend, with provenance
+                (missing = not tagged, never 0)
+  part_answers  durable per-part answers, so a multi-part chat never pays twice for a part
+  labels        second-backend labels for the calibration sample, with provenance
+  docs          small JSON documents (calibration report, repeated asks, redaction policy)
+
+Every update that must be atomic (a chat's status together with its tags) is one SQLite
+transaction. A run holds an exclusive lock on ``<state>/.lock`` so two runs cannot interleave.
+``tracker.csv`` and ``out/`` are derived views, written with unique temporary names and renamed
+into place.
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import errno
+import fcntl
 import hashlib
+import io
 import json
 import os
+import sqlite3
+import tempfile
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+SCHEMA_VERSION = "2"
 
 TRACKER_FIELDS = (
     "chat_id",
     "source",
     "file_hash",
     "date",
+    "last_date",
     "human_messages",
     "chars",
     "parts",
@@ -31,6 +50,37 @@ TRACKER_FIELDS = (
     "flagged",
     "note",
 )
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chats (
+  chat_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  date TEXT NOT NULL DEFAULT '',
+  last_date TEXT NOT NULL DEFAULT '',
+  human_messages INTEGER NOT NULL DEFAULT 0,
+  chars INTEGER NOT NULL DEFAULT 0,
+  parts INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'new',
+  flagged TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  messages TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS tags (chat_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS labels (chat_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS part_answers (
+  chat_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  cache_key TEXT NOT NULL,
+  part INTEGER NOT NULL,
+  answer TEXT NOT NULL,
+  PRIMARY KEY (chat_id, role, cache_key, part)
+);
+CREATE TABLE IF NOT EXISTS docs (name TEXT PRIMARY KEY, data TEXT NOT NULL);
+"""
+
+_CHAT_COLUMNS = TRACKER_FIELDS
 
 
 class StateError(RuntimeError):
@@ -63,8 +113,71 @@ class State:
         if create:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.root, 0o700)
+        self._conn: sqlite3.Connection | None = None
+        self._lock_fd: int | None = None
+        # Test hook: runs inside the commit transaction, after the status update and before the
+        # tag write, so tests can simulate a crash at the worst possible moment.
+        self.mid_commit_hook: Callable[[], None] | None = None
 
-    # -- paths -----------------------------------------------------------------------------
+    # -- database ----------------------------------------------------------------------------
+    @property
+    def db_path(self) -> Path:
+        return self.root / "state.db"
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            if not self.db_path.exists():
+                fd = os.open(self.db_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+            os.chmod(self.db_path, 0o600)
+            conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+            conn.execute("PRAGMA secure_delete = ON")
+            conn.executescript(_SCHEMA)
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', ?)", (SCHEMA_VERSION,))
+            self._conn = conn
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+        self.unlock()
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """One atomic unit of work: everything inside commits together or not at all."""
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+
+    # -- run lock ----------------------------------------------------------------------------
+    def lock(self) -> None:
+        """Take the exclusive run lock, or fail fast if another run holds it."""
+        if self._lock_fd is not None:
+            return
+        fd = os.open(self.root / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                raise StateError(f"another session-skills run is using {self.root}; wait for it to finish") from None
+            raise
+        self._lock_fd = fd
+
+    def unlock(self) -> None:
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    # -- paths / files -------------------------------------------------------------------------
     def path(self, name: str) -> Path:
         return self.root / name
 
@@ -75,7 +188,6 @@ class State:
         os.chmod(out, 0o700)
         return out
 
-    # -- low-level io ----------------------------------------------------------------------
     def _private_dirs(self, directory: Path) -> None:
         """Create ``directory`` (and parents below the state root) as 0700."""
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -85,78 +197,157 @@ class State:
             current = current.parent
 
     def write_text(self, name: str | Path, text: str) -> Path:
+        """Write a derived file atomically: unique temp file in the same directory, then rename."""
         target = name if isinstance(name, Path) else self.path(name)
         self._private_dirs(target.parent)
-        tmp = target.with_name(target.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        os.replace(tmp, target)
-        os.chmod(target, 0o600)
+        fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
         return target
 
-    def read_jsonl(self, name: str) -> list[dict[str, Any]]:
-        path = self.path(name)
-        if not path.is_file():
-            return []
-        rows = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
-        return rows
-
-    def write_jsonl(self, name: str, rows: Iterable[dict[str, Any]]) -> None:
-        self.write_text(name, "".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n" for r in rows))
-
+    # -- small JSON documents ------------------------------------------------------------------
     def read_json(self, name: str) -> dict[str, Any]:
-        path = self.path(name)
-        if not path.is_file():
+        row = self.conn.execute("SELECT data FROM docs WHERE name = ?", (name,)).fetchone()
+        if not row:
             return {}
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(row[0])
         except ValueError:
             return {}
         return value if isinstance(value, dict) else {}
 
     def write_json(self, name: str, value: dict[str, Any]) -> None:
-        self.write_text(name, json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO docs (name, data) VALUES (?, ?)",
+                (name, json.dumps(value, sort_keys=True, ensure_ascii=False)),
+            )
 
-    # -- domain files ----------------------------------------------------------------------
+    # -- chats and tracker -----------------------------------------------------------------------
     def chats(self) -> dict[str, dict[str, Any]]:
-        return {r["chat_id"]: r for r in self.read_jsonl("chats.jsonl") if "chat_id" in r}
-
-    def save_chats(self, chats: dict[str, dict[str, Any]]) -> None:
-        self.write_jsonl("chats.jsonl", (chats[k] for k in sorted(chats)))
+        rows = self.conn.execute("SELECT chat_id, source, date, last_date, messages FROM chats ORDER BY chat_id")
+        return {
+            cid: {"chat_id": cid, "source": source, "date": date, "last_date": last, "messages": json.loads(messages)}
+            for cid, source, date, last, messages in rows
+        }
 
     def tracker(self) -> dict[str, dict[str, str]]:
-        path = self.path("tracker.csv")
-        if not path.is_file():
-            return {}
-        with path.open(newline="", encoding="utf-8") as handle:
-            return {r["chat_id"]: dict(r) for r in csv.DictReader(handle) if r.get("chat_id")}
+        rows = self.conn.execute(f"SELECT {', '.join(_CHAT_COLUMNS)} FROM chats ORDER BY chat_id")
+        return {row[0]: {k: str(v) for k, v in zip(_CHAT_COLUMNS, row, strict=True)} for row in rows}
 
-    def save_tracker(self, rows: dict[str, dict[str, str]]) -> None:
-        import io
+    def save_corpus(
+        self,
+        tracker: dict[str, dict[str, str]],
+        chats: dict[str, dict[str, Any]],
+        drop_tags: Iterable[str] = (),
+    ) -> None:
+        """Upsert chats and drop tags of changed chats in one transaction (``build-list``)."""
+        placeholders = ", ".join("?" * (len(_CHAT_COLUMNS) + 1))
+        with self.transaction() as conn:
+            for cid in sorted(tracker):
+                row = tracker[cid]
+                conn.execute(
+                    f"INSERT OR REPLACE INTO chats ({', '.join(_CHAT_COLUMNS)}, messages) VALUES ({placeholders})",
+                    (
+                        cid,
+                        row.get("source", ""),
+                        row.get("file_hash", ""),
+                        row.get("date", ""),
+                        row.get("last_date", ""),
+                        int(row.get("human_messages") or 0),
+                        int(row.get("chars") or 0),
+                        int(row.get("parts") or 1),
+                        row.get("status") or "new",
+                        row.get("flagged", ""),
+                        row.get("note", ""),
+                        json.dumps(chats[cid].get("messages", []), ensure_ascii=False),
+                    ),
+                )
+            for cid in drop_tags:
+                conn.execute("DELETE FROM tags WHERE chat_id = ?", (cid,))
+                conn.execute("DELETE FROM part_answers WHERE chat_id = ?", (cid,))
 
+    def update_messages(self, updates: dict[str, list[dict[str, Any]]]) -> None:
+        """Rewrite stored messages (a new redaction policy) in one transaction, then compact the
+        file so no page with the old text survives."""
+        with self.transaction() as conn:
+            for cid, messages in updates.items():
+                conn.execute(
+                    "UPDATE chats SET messages = ? WHERE chat_id = ?",
+                    (json.dumps(messages, ensure_ascii=False), cid),
+                )
+        self.conn.execute("VACUUM")
+
+    def set_status(self, cid: str, status: str, flagged: str = "", note: str = "") -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE chats SET status = ?, flagged = ?, note = ? WHERE chat_id = ?",
+                (status, flagged, note, cid),
+            )
+
+    def commit_tag(self, cid: str, flagged: str, note: str, tag: dict[str, Any]) -> None:
+        """Mark a chat tagged and store its tag atomically; drop its per-part scratch answers."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE chats SET status = 'tagged', flagged = ?, note = ? WHERE chat_id = ?",
+                (flagged, note, cid),
+            )
+            if self.mid_commit_hook is not None:
+                self.mid_commit_hook()
+            conn.execute(
+                "INSERT OR REPLACE INTO tags (chat_id, data) VALUES (?, ?)",
+                (cid, json.dumps(tag, sort_keys=True, ensure_ascii=False)),
+            )
+            conn.execute("DELETE FROM part_answers WHERE chat_id = ? AND role = 'tag'", (cid,))
+
+    def export_tracker(self) -> Path:
+        """Write ``tracker.csv``, a read-only view of the chat table."""
         buffer = io.StringIO()
         writer = csv.DictWriter(buffer, fieldnames=TRACKER_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        for key in sorted(rows):
-            writer.writerow({f: rows[key].get(f, "") for f in TRACKER_FIELDS})
-        self.write_text("tracker.csv", buffer.getvalue())
+        for row in self.tracker().values():
+            writer.writerow({f: row.get(f, "") for f in TRACKER_FIELDS})
+        return self.write_text("tracker.csv", buffer.getvalue())
 
+    # -- tags, labels, part answers ------------------------------------------------------------
     def tags(self) -> dict[str, dict[str, Any]]:
-        return {r["chat_id"]: r for r in self.read_jsonl("tags.jsonl") if "chat_id" in r}
-
-    def save_tags(self, tags: dict[str, dict[str, Any]]) -> None:
-        self.write_jsonl("tags.jsonl", (tags[k] for k in sorted(tags)))
+        return {cid: json.loads(data) for cid, data in self.conn.execute("SELECT chat_id, data FROM tags")}
 
     def labels(self) -> dict[str, dict[str, Any]]:
-        return {r["chat_id"]: r for r in self.read_jsonl("labels.jsonl") if "chat_id" in r}
+        return {cid: json.loads(data) for cid, data in self.conn.execute("SELECT chat_id, data FROM labels")}
 
-    def save_labels(self, labels: dict[str, dict[str, Any]]) -> None:
-        self.write_jsonl("labels.jsonl", (labels[k] for k in sorted(labels)))
+    def save_label(self, cid: str, label: dict[str, Any]) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO labels (chat_id, data) VALUES (?, ?)",
+                (cid, json.dumps(label, sort_keys=True, ensure_ascii=False)),
+            )
+            conn.execute("DELETE FROM part_answers WHERE chat_id = ? AND role = 'label'", (cid,))
+
+    def part_answers(self, cid: str, role: str, cache_key: str) -> dict[int, dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT part, answer FROM part_answers WHERE chat_id = ? AND role = ? AND cache_key = ?",
+            (cid, role, cache_key),
+        )
+        return {int(part): json.loads(answer) for part, answer in rows}
+
+    def save_part_answer(self, cid: str, role: str, cache_key: str, part: int, answer: dict[str, Any]) -> None:
+        """Durably store one part's answer; answers under an older cache key are dropped."""
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM part_answers WHERE chat_id = ? AND role = ? AND cache_key != ?",
+                (cid, role, cache_key),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO part_answers (chat_id, role, cache_key, part, answer) VALUES (?, ?, ?, ?, ?)",
+                (cid, role, cache_key, part, json.dumps(answer, sort_keys=True)),
+            )

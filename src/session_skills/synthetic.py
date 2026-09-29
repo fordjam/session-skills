@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Sequence
 
 Turn = tuple[str, str]  # (role, text) with role "user" or "assistant"
 
@@ -25,12 +25,12 @@ class Conversation:
 
 
 def _stamp(day: date, minute: int) -> str:
-    moment = datetime(day.year, day.month, day.day, 9, 0, tzinfo=timezone.utc) + timedelta(minutes=minute)
+    moment = datetime(day.year, day.month, day.day, 9, 0, tzinfo=UTC) + timedelta(minutes=minute)
     return moment.isoformat().replace("+00:00", "Z")
 
 
 def _ms(day: date, minute: int) -> int:
-    moment = datetime(day.year, day.month, day.day, 9, 0, tzinfo=timezone.utc) + timedelta(minutes=minute)
+    moment = datetime(day.year, day.month, day.day, 9, 0, tzinfo=UTC) + timedelta(minutes=minute)
     return int(moment.timestamp() * 1000)
 
 

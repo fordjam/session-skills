@@ -3,6 +3,7 @@ runtime so that no literal secret pattern appears in the repository."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import date
 from pathlib import Path
 
@@ -34,6 +35,10 @@ class Secrets:
     home_linux = "/home/" + "bob" + "/src/tool"
     pem = "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEow\n-----END " + "RSA PRIVATE KEY-----"
     password = "hunter2-" + "sup3r"
+    session_cookie = "abc123" + "abc123"
+    putty = "PuTTY-User-Key-File-" + "3: ssh-ed25519\nPrivate-Lines: 1\nAAAAsecretbody\nPrivate-MAC: 00ff"
+    pgp = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP " + "PRIVATE KEY BLOCK-----"
+    jwt_unsigned = "eyJ" + "hbGciOiJub25lIn0" + "." + "eyJzdWIiOiIxMjM0In0" + "."
 
     @classmethod
     def all_values(cls) -> list[str]:
@@ -60,6 +65,7 @@ def roots(tmp_path: Path) -> dict[str, Path]:
 @pytest.fixture
 def cfg(tmp_path: Path, roots: dict[str, Path]) -> Config:
     config = Config(state_dir=tmp_path / "state")
+    config.retry_delay = 0
     config.sources = {
         "claude_code": SourceConfig(True, [str(roots["claude_code"] / "**" / "*.jsonl")]),
         "codex": SourceConfig(True, [str(roots["codex"] / "sessions" / "**" / "*.jsonl")]),
@@ -69,5 +75,7 @@ def cfg(tmp_path: Path, roots: dict[str, Path]) -> Config:
 
 
 @pytest.fixture
-def state(cfg: Config) -> State:
-    return State(cfg.state_dir)
+def state(cfg: Config) -> Iterator[State]:
+    opened = State(cfg.state_dir)
+    yield opened
+    opened.close()

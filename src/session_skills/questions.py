@@ -89,10 +89,11 @@ QUESTIONS: tuple[Question, ...] = (
         "match-requested-format",
         "Match the requested format",
         "Use when choosing how to lay out a reply or file. The user repeatedly corrected formatting.",
-        "Use the format the user asked for; default to plain prose with minimal markdown.",
+        "Use the layout the user asked for (table, list, plain text); the evidence quotes show which.",
         (
             "Mirror any format the user specified (table, list, plain text).",
-            "Do not add headings to short replies.",
+            "Read the evidence quotes below to see which way the corrections went; this pattern does not "
+            "say whether the user wanted more structure or less.",
         ),
         "Format corrections were a recurring source of rework.",
     ),

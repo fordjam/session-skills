@@ -115,3 +115,68 @@ def test_empty(value):
 def test_short_quote_is_single_line_and_capped(secrets):
     quote = short_quote(f"first line\nsecond | line with {secrets.email} " + "x" * 300, 60)
     assert "\n" not in quote and "|" not in quote and len(quote) <= 60 and secrets.email not in quote
+
+
+# -- credential formats the pre-release review found leaking ------------------------------------
+
+def test_python_dict_and_other_quoted_secret_keys(secrets):
+    for text in (
+        f"{{'password': '{secrets.password}'}}",  # reviewer's example
+        f'{{"db_password": "{secrets.password}"}}',
+        f"config['api_key'] = '{secrets.password}'",
+        f'settings = {{"client_secret" => "{secrets.password}"}}',
+        f"db_password = {secrets.password}",
+        f"passphrase: {secrets.password}",
+    ):
+        out = redact(text)
+        assert secrets.password not in out, text
+        assert redact(out) == out
+
+
+def test_cookie_and_authorization_headers(secrets):
+    for text in (
+        "Cookie: sessionid=" + secrets.session_cookie,  # reviewer's example
+        "Set-Cookie: sid=" + secrets.session_cookie + "; HttpOnly; Path=/",
+        "curl -H 'Authorization: Token " + secrets.session_cookie + "' https://api.example.org",
+        "Proxy-Authorization: Basic " + secrets.session_cookie,
+        'curl -H "X-Api-Key: ' + secrets.session_cookie + '" https://api.example.org',
+        "sessionid=" + secrets.session_cookie,
+    ):
+        out = redact(text)
+        assert secrets.session_cookie not in out, text
+        assert redact(out) == out
+
+
+def test_private_keys_of_every_kind(secrets):
+    for text in (secrets.pem, secrets.pgp, secrets.putty):
+        out = redact(f"here:\n{text}\nthanks")
+        assert "MIIEow" not in out and "lQOYBF" not in out and "secretbody" not in out
+        assert "[REDACTED:private-key]" in out and out.endswith("thanks")
+
+
+def test_jwts_including_unsigned(secrets):
+    for value in (secrets.jwt, secrets.jwt_unsigned):
+        out = redact(f"token {value} end")
+        assert "eyJzdWIi" not in out and out.endswith(" end")
+
+
+def test_connection_strings(secrets):
+    for text in (
+        f"postgres://admin:{secrets.password}@db.local/app",
+        f"redis://:{secrets.password}@cache.local:6379/0",
+        f"Server=db;Database=app;User Id=sa;Password={secrets.password};",
+        f"DefaultEndpointsProtocol=https;AccountName=demo;AccountKey={secrets.password}+/=;",
+        f"jdbc:mysql://db.local/app?user=app&password={secrets.password}",
+        f"Driver={{SQL Server}};Uid=app;Pwd={secrets.password};",
+    ):
+        out = redact(text)
+        assert secrets.password not in out, text
+
+
+def test_new_patterns_leave_ordinary_text_alone():
+    for sample in (
+        "set max_tokens=100 and keep the token budget small",
+        "passwords are hard; the cookie jar is empty",
+        "the authorization flow is described in docs/auth.md",
+    ):
+        assert redact(sample) == sample
